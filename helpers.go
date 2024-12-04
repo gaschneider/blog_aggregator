@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/gaschneider/blog_aggregator/internal/database"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 func getParams() ([]string, error) {
@@ -79,6 +81,27 @@ func addFeedFollow(s *state, feedUrl string, user database.User) (database.Creat
 
 }
 
+func autoDetectLayout(dateStr string) (time.Time, error) {
+	layouts := []string{
+		"Mon, 02 Jan 2006 15:04:05 -0700", // "Tue, 03 Dec 2024 15:06:34 +0000"
+		"02 Jan 2006 15:04:05",            // "03 Dec 2024 15:06:34"
+		"2006-01-02 15:04:05",             // "2024-12-03 15:06:34"
+		"2006-01-02",                      // "2024-12-03"
+		"15:04:05",                        // "15:06:34"
+		"2006-01-02T15:04:05Z",            // "2024-12-03T15:06:34Z"
+		"2006-01-02 15:04:05 -0700",       // "2024-12-03 15:06:34 +0000"
+	}
+
+	for _, layout := range layouts {
+		parsedTime, err := time.Parse(layout, dateStr)
+		if err == nil {
+			return parsedTime, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("unable to parse time string: %s", dateStr)
+}
+
 func scrapeFeeds(s *state) error {
 	nextFeed, err := s.db.GetNextFeedToFetch(context.Background())
 	if err != nil {
@@ -96,7 +119,27 @@ func scrapeFeeds(s *state) error {
 	}
 
 	for _, item := range rssFeed.Channel.Item {
-		fmt.Printf("%v\n", item.Title)
+		publishedDate, err := autoDetectLayout(item.PubDate)
+		if err != nil {
+			fmt.Printf("error parsing date %v\n", item.PubDate)
+			continue
+		}
+
+		_, err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now(),
+			Title: item.Title, Url: item.Link, Description: item.Description, PublishedAt: publishedDate, FeedID: nextFeed.ID,
+		})
+		if err != nil {
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+				pattern := `"(posts_url_key)"`
+				re := regexp.MustCompile(pattern)
+				matches := re.FindStringSubmatch(pqErr.Message)
+				if len(matches) > 1 {
+					continue
+				}
+			}
+			fmt.Printf("error: %v\n", err)
+		}
 	}
 
 	return nil
